@@ -1,0 +1,9 @@
+*.swp
+*.o
+*.d
+*.so
+*.out
+*.a
+/test/test
+/tags
+/version.h
