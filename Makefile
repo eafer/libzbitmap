@@ -1,6 +1,6 @@
 CC = gcc
 
-CFLAGS = --std=gnu99 -O2 -Wall -Wextra -fno-strict-aliasing -I..
+CFLAGS = --std=gnu99 -O3 -Wall -Wextra -fno-strict-aliasing -I..
 
 libzbitmap.a: libzbitmap.o
 	ar rcs libzbitmap.a libzbitmap.o

@@ -1,12 +1,16 @@
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "libzbitmap.h"
 
 #define __packed    __attribute__((packed))
 
+#define MIN(x, y)   ((x) > (y) ? (y) : (x))
+
 #define ZBM_MAGIC   0x094D425A
 
-#define ZBM_MAX_DECMP_CHUNK_SIZE    0x8000
+#define ZBM_MAX_DECMP_CHUNK_SIZE        0x8000
+#define ZBM_MAX_DECMP_CHUNK_SIZE_BITS   15
 
 struct uint24 {
     uint16_t    lo;
@@ -267,7 +271,7 @@ static int zbm_decompress_single_bitmap(struct zbm_state *state)
 
 /* Pointer to a bit */
 struct bit_ptr {
-    const uint8_t   *addr;  /* Address of the byte */
+    uint8_t         *addr;  /* Address of the byte */
     int             offset; /* Bit number */
 };
 
@@ -319,7 +323,7 @@ static int zbm_read_bitmaps(struct zbm_state *state)
     if(state->len < ZBM_BITMAP_BYTECNT)
         return ZBM_INVAL;
 
-    bmap.addr = state->src_end - ZBM_BITMAP_BYTECNT;
+    bmap.addr = (uint8_t *)state->src_end - ZBM_BITMAP_BYTECNT;
     bmap.offset = 0;
 
     for(i = 0; i < ZBM_BITMAP_COUNT; ++i) {
@@ -423,4 +427,666 @@ int zbm_decompress(void *dest, size_t dest_size, const void *src, size_t src_siz
 
     *out_len = state.prewritten;
     return 0;
+}
+
+#define ZBM_MAX_BITMAP_COUNT    (ZBM_MAX_DECMP_CHUNK_SIZE >> 3)
+#define ZBM_POSSIBLE_BMPROTS    (1 << 10)
+
+struct zbm_compress_state {
+    /* Updated during a chunk write */
+    const uint8_t   *src;       /* Next byte to read */
+    uint32_t        read;       /* Bytes processed so far for current chunk */
+    uint32_t        written;    /* Bytes written so far for current chunk */
+    uint8_t         *dest;      /* Write the next byte here */
+    uint16_t        period;     /* Repetition period for compression, in bytes */
+
+    /* Updated right before a chunk write */
+    const uint8_t   *dest_end;  /* Maximum limit for the current chunk */
+    const uint8_t   *src_end;   /* End of current decompressed chunk */
+    uint32_t        decmp_len;  /* Decompressed length of the chunk */
+
+    /* Updated after a chunk write */
+    size_t          dest_left;  /* Room left in destination buffer */
+    size_t          preread;    /* Bytes processed for previous chunks */
+    size_t          prewritten; /* Bytes written for previous chunks */
+    size_t          src_left;   /* Room left in the source buffer */
+
+    /* Array of all bitmaps applied for the current chunk */
+    struct zbm_bmap bitmaps[ZBM_MAX_BITMAP_COUNT];
+    uint16_t        periods[ZBM_MAX_BITMAP_COUNT];
+    int             bmp_cnt;
+
+    /* How many times was each bitmap-rotation combination applied? */
+    uint64_t        usecnts[ZBM_POSSIBLE_BMPROTS];
+
+    /* Array of bitmaps applied most often */
+    struct zbm_bmap top_bitmaps[ZBM_BITMAP_COUNT];
+};
+
+/* Internal error used when a compression attempt was ineffective */
+#define ZBM_CANT_COMPRESS   (-1024)
+
+static int zbm_bmprot(struct zbm_bmap *bmap)
+{
+    return (int)bmap->bitmap << 2 | (int)bmap->period_bytecnt;
+}
+
+static int zbm_write_magic(struct zbm_compress_state *state)
+{
+    uint32_t *magic_p;
+
+    if(state->dest_left < sizeof(*magic_p))
+        return ZBM_INVAL;
+
+    magic_p = (uint32_t *)state->dest;
+    *magic_p = ZBM_MAGIC;
+
+    state->dest += sizeof(*magic_p);
+    state->dest_left -= sizeof(*magic_p);
+    state->prewritten += sizeof(*magic_p);
+    return 0;
+}
+
+static int zbm_build_uncompressed_chunk(struct zbm_compress_state *state)
+{
+    /* Undo the previous compression attempt */
+    state->src -= state->read;
+    state->read = 0;
+    state->dest -= state->written - sizeof(struct zbm_chunk_hdr);
+    state->written = sizeof(struct zbm_chunk_hdr);
+
+    memcpy(state->dest, state->src, state->decmp_len);
+
+    state->src += state->decmp_len;
+    state->read += state->decmp_len;
+    state->written += state->decmp_len;
+    state->dest += state->decmp_len;
+    return 0;
+}
+
+static uint8_t zbm_compare_bytes(uint64_t bytes1, uint64_t bytes2)
+{
+    static const uint64_t mask0 = 0xff;
+    static const uint64_t mask1 = 0xff00;
+    static const uint64_t mask2 = 0xff0000;
+    static const uint64_t mask3 = 0xff000000;
+    static const uint64_t mask4 = 0xff00000000;
+    static const uint64_t mask5 = 0xff0000000000;
+    static const uint64_t mask6 = 0xff000000000000;
+    static const uint64_t mask7 = 0xff00000000000000;
+    uint8_t diff = 0;
+    uint64_t xor;
+
+    xor = bytes1 ^ bytes2;
+    diff += (xor & mask0) != 0;
+    diff += (xor & mask1) != 0;
+    diff += (xor & mask2) != 0;
+    diff += (xor & mask3) != 0;
+    diff += (xor & mask4) != 0;
+    diff += (xor & mask5) != 0;
+    diff += (xor & mask6) != 0;
+    diff += (xor & mask7) != 0;
+    return diff;
+}
+
+static void zbm_append_new_bitmap(struct zbm_compress_state *state, uint8_t bitmap, uint16_t period)
+{
+    struct zbm_bmap *new_bmp = NULL;
+
+    new_bmp = &state->bitmaps[state->bmp_cnt];
+    new_bmp->bitmap = bitmap;
+    state->periods[state->bmp_cnt] = period;
+    if(period == state->period)
+        new_bmp->period_bytecnt = 0;
+    else if(period <= 0xff)
+        new_bmp->period_bytecnt = 1;
+    else
+        new_bmp->period_bytecnt = 2;
+    ++state->bmp_cnt;
+
+    ++state->usecnts[zbm_bmprot(new_bmp)];
+
+    state->period = period;
+}
+
+static uint8_t zbm_calculate_bitmap(const uint8_t *bytes1, const uint8_t *bytes2, uint8_t size)
+{
+    uint8_t bitmap;
+    uint8_t i;
+
+    bitmap = 0;
+    for(i = 0; i < size; ++i) {
+        if(bytes1[i] != bytes2[i])
+            bitmap |= 1 << i;
+    }
+    return bitmap;
+}
+
+static void zbm_find_good_pattern(struct zbm_compress_state *state)
+{
+    uint64_t needle;
+    const uint8_t *to_compare = NULL;
+    const uint8_t *next = NULL;
+    const uint8_t *best = NULL;
+    const uint8_t *split = NULL;
+    int bytecnt, diff, best_cost;
+    uint8_t bitmap;
+    int i;
+
+    bytecnt = MIN(8, state->decmp_len - state->read);
+    needle = 0;
+    for(i = 0; i < bytecnt; ++i)
+        needle |= (uint64_t)state->src[i] << i * 8;
+
+    /*
+     * We'll estimate the cost of a period as the number of digits needed to
+     * store it plus the number of characters that get changed. This isn't
+     * perfect of course, because bitmap reuse is also a good idea.
+     */
+
+    diff = zbm_compare_bytes(*(uint64_t *)(state->src - state->period), needle);
+    best = state->src - state->period;
+    best_cost = diff;
+    if(best_cost <= 1)
+        goto done;
+
+    /* We first look for patterns that can be reached with a 1-byte period */
+    to_compare = state->src - MIN(0xff, state->preread + state->read);
+    split = to_compare;
+    while(to_compare <= state->src - 8) {
+        diff = zbm_compare_bytes(*(uint64_t *)to_compare, needle);
+        if(diff + 1 < best_cost) {
+            best = to_compare;
+            best_cost = diff + 1;
+            if(best_cost == 1)
+                goto done;
+        }
+        ++to_compare;
+    }
+    if(best_cost == 2)
+        goto done;
+
+    /*
+     * We now look for patterns that can be reached with a 2-byte period, but
+     * we focus only on the ones that start with the same byte. Checking
+     * everything would take too long.
+     */
+    to_compare = state->src - MIN(0xffff, state->preread + state->read);
+    while(to_compare < split) {
+        next = memchr(to_compare, state->src[0], split - to_compare);
+        if(!next)
+            break;
+        diff = zbm_compare_bytes(*(uint64_t *)next, needle);
+        if(diff + 2 < best_cost) {
+            best = next;
+            best_cost = diff + 2;
+            if(best_cost == 2)
+                goto done;
+        }
+        to_compare = next + 1;
+    }
+
+done:
+    bitmap = zbm_calculate_bitmap(best, state->src, bytecnt);
+    zbm_append_new_bitmap(state, bitmap, state->src - best);
+}
+
+static int zbm_write_new_data(struct zbm_compress_state *state)
+{
+    struct zbm_bmap *bmap = &state->bitmaps[state->bmp_cnt - 1];
+    int i;
+
+    for(i = 0; i < 8; ++i) {
+        if(state->src == state->src_end)
+            break;
+        if(state->dest == state->dest_end)
+            return ZBM_CANT_COMPRESS;
+        if(bmap->bitmap & 1 << i) {
+            *state->dest = *state->src;
+            ++state->dest;
+            ++state->written;
+        }
+        ++state->src;
+        ++state->read;
+    }
+    return 0;
+}
+
+static int zbm_compress_eight_bytes(struct zbm_compress_state *state)
+{
+    zbm_find_good_pattern(state);
+    return zbm_write_new_data(state);
+}
+
+static int zbm_build_initial_bitmap(struct zbm_compress_state *state)
+{
+    struct zbm_bmap *init = &state->bitmaps[0];
+
+    init->bitmap = 0xff;
+    init->period_bytecnt = 0;
+    state->bmp_cnt = 1;
+    state->usecnts[zbm_bmprot(init)] = 1;
+
+    if(state->decmp_len - state->read < 8)
+        return ZBM_CANT_COMPRESS;
+    memcpy(state->dest, state->src, 8);
+
+    state->dest += 8;
+    state->src += 8;
+    state->read += 8;
+    state->written += 8;
+    return 0;
+}
+
+static int zbm_write_metadata_1(struct zbm_compress_state *state)
+{
+    struct zbm_bmap *bmap = NULL;
+    uint16_t period;
+    int i;
+
+    /* The first metadata area stores the periods, when they change */
+    for(i = 0; i < state->bmp_cnt; ++i) {
+        bmap = &state->bitmaps[i];
+        period = state->periods[i];
+
+        if(bmap->period_bytecnt == 0)
+            continue;
+
+        if(state->dest == state->dest_end)
+            return ZBM_CANT_COMPRESS;
+        *state->dest = period;
+        ++state->dest;
+        ++state->written;
+
+        if(bmap->period_bytecnt == 1)
+            continue;
+
+        if(state->dest == state->dest_end)
+            return ZBM_CANT_COMPRESS;
+        *state->dest = period >> 8;
+        ++state->dest;
+        ++state->written;
+    }
+    return 0;
+}
+
+static int zbm_write_metadata_2(struct zbm_compress_state *state)
+{
+    struct zbm_bmap *bmap = NULL;
+    int i;
+
+    /* The second metadata area stores most of the bitmaps */
+    for(i = 0; i < state->bmp_cnt; ++i) {
+        bmap = &state->bitmaps[i];
+
+        /* This is one of the top bitmaps that go in the end of the chunk */
+        if(state->usecnts[zbm_bmprot(bmap)] == 0)
+            continue;
+
+        if(state->dest == state->dest_end)
+            return ZBM_CANT_COMPRESS;
+        *state->dest = bmap->bitmap;
+        ++state->dest;
+        ++state->written;
+    }
+    return 0;
+}
+
+static int zbm_equal_bmaps(struct zbm_bmap *bmap1, struct zbm_bmap *bmap2)
+{
+    if(bmap1->bitmap != bmap2->bitmap)
+        return 0;
+    if(bmap1->period_bytecnt != bmap2->period_bytecnt)
+        return 0;
+    return 1;
+}
+
+static int zbm_write_metadata_3(struct zbm_compress_state *state)
+{
+    struct zbm_bmap *bmap = NULL;
+    struct zbm_bmap *top_bmap = NULL;
+    int nibble = 0;
+    int to_write = 0;
+    int i, j;
+
+    /* TODO: repetitions */
+    for(i = 0; i < state->bmp_cnt; ++i) {
+        bmap = &state->bitmaps[i];
+
+        if(state->dest == state->dest_end)
+            return ZBM_CANT_COMPRESS;
+
+        /* This is one of the top bitmaps that go in the end of the chunk */
+        if(state->usecnts[zbm_bmprot(bmap)] == 0) {
+            for(j = 0; j < ZBM_BITMAP_COUNT; ++j) {
+                top_bmap = &state->top_bitmaps[j];
+                if(zbm_equal_bmaps(top_bmap, bmap)) {
+                    to_write = j + 3;
+                    break;
+                }
+            }
+        } else {
+            to_write = bmap->period_bytecnt;
+        }
+
+        if(nibble == 0)
+            *state->dest = to_write;
+        else
+            *state->dest |= to_write << 4;
+        nibble ^= 1;
+        if(nibble == 0) {
+            ++state->dest;
+            ++state->written;
+        }
+    }
+
+    /* Leave the trailing nibble alone and move on to the next byte */
+    if(nibble == 1) {
+        ++state->dest;
+        ++state->written;
+    }
+    return 0;
+}
+
+/* This function does not perform boundary checks, the caller must do it */
+static void zbm_write_single_bit(struct bit_ptr *bit, int val)
+{
+    *bit->addr |= val << bit->offset;
+
+    ++bit->offset;
+    if(bit->offset != 8)
+        return;
+    bit->offset = 0;
+    ++bit->addr;
+    return;
+}
+
+/* This function does not perform boundary checks, the caller must do it */
+static void zbm_write_single_bitmap(struct bit_ptr *bit, struct zbm_bmap bmap)
+{
+    int i;
+
+    /* The bitmap itself */
+    for(i = 0; i < 8; ++i)
+        zbm_write_single_bit(bit, bmap.bitmap >> i & 1);
+
+    /* The trailing bits for the period bytecount */
+    for(i = 0; i < 2; ++i)
+        zbm_write_single_bit(bit, bmap.period_bytecnt >> i & 1);
+}
+
+static int zbm_write_trailing_bitmaps(struct zbm_compress_state *state)
+{
+    struct bit_ptr bmap = {0};
+    int i;
+
+    if(state->dest_end - state->dest < ZBM_BITMAP_BYTECNT)
+        return ZBM_CANT_COMPRESS;
+    memset(state->dest, 0, ZBM_BITMAP_BYTECNT);
+
+    bmap.addr = state->dest;
+    bmap.offset = 0;
+
+    for(i = 0; i < ZBM_BITMAP_COUNT; ++i)
+        zbm_write_single_bitmap(&bmap, state->top_bitmaps[i]);
+
+    state->dest += ZBM_BITMAP_BYTECNT;
+    state->written += ZBM_BITMAP_BYTECNT;
+    return 0;
+}
+
+static struct uint24 zbm_u32_to_u24(uint32_t n)
+{
+    struct uint24 res;
+
+    res.lo = n;
+    res.hi = n >> 16;
+    return res;
+}
+
+struct top_bmap {
+    int         idx;
+    uint64_t    usecnt;
+};
+
+/* The array is sorted by use count, in descending order */
+static void zbm_insert_in_top_bmaps(int idx, uint64_t usecnt, struct top_bmap tops[ZBM_BITMAP_COUNT])
+{
+    int i;
+
+    for(i = 0; i < ZBM_BITMAP_COUNT; ++i) {
+        if(tops[i].usecnt < usecnt)
+            break;
+    }
+
+    if(i == ZBM_BITMAP_COUNT)
+        return;
+
+    memmove(&tops[i + 1], &tops[i], ZBM_BITMAP_COUNT - i - 1);
+    tops[i].idx = idx;
+    tops[i].usecnt = usecnt;
+}
+
+static void zbm_find_most_common_bitmaps(struct zbm_compress_state *state)
+{
+    struct top_bmap tops[ZBM_BITMAP_COUNT] = {0};
+    struct zbm_bmap *bmap = NULL;
+    int i;
+
+    for(i = 0; i < state->bmp_cnt; ++i) {
+        bmap = &state->bitmaps[i];
+        zbm_insert_in_top_bmaps(i, state->usecnts[zbm_bmprot(bmap)], tops);
+        bmap = NULL;
+    }
+
+    for(i = 0; i < ZBM_BITMAP_COUNT; ++i) {
+        if(tops[i].usecnt == 0) {
+            /* Very few bitmaps, all are top */
+            state->top_bitmaps[i].bitmap = 0;
+            state->top_bitmaps[i].period_bytecnt = 0;
+            continue;
+        }
+        bmap = &state->bitmaps[tops[i].idx];
+        state->top_bitmaps[i] = *bmap;
+        /* Mark this as unused for the second metadata area */
+        state->usecnts[zbm_bmprot(bmap)] = 0;
+    }
+}
+
+static int zbm_build_metadata(struct zbm_compress_state *state, struct zbm_cmp_chunk_hdr *hdr)
+{
+    int err;
+
+    zbm_find_most_common_bitmaps(state);
+
+    hdr->meta_off_1 = zbm_u32_to_u24(state->written);
+    err = zbm_write_metadata_1(state);
+    if(err)
+        return err;
+
+    hdr->meta_off_2 = zbm_u32_to_u24(state->written);
+    err = zbm_write_metadata_2(state);
+    if(err)
+        return err;
+
+    hdr->meta_off_3 = zbm_u32_to_u24(state->written);
+    err = zbm_write_metadata_3(state);
+    if(err)
+        return err;
+
+    return zbm_write_trailing_bitmaps(state);
+}
+
+static int zbm_build_compressed_chunk(struct zbm_compress_state *state)
+{
+    struct zbm_cmp_chunk_hdr *hdr = NULL;
+    int err;
+
+    if(sizeof(*hdr) > (size_t)(state->dest_end - state->dest))
+        return ZBM_CANT_COMPRESS;
+    state->dest -= sizeof(hdr->hdr);
+    state->written -= sizeof(hdr->hdr);
+    hdr = (struct zbm_cmp_chunk_hdr *)state->dest;
+    state->dest += sizeof(*hdr);
+    state->written += sizeof(*hdr);
+
+    memset(state->bitmaps, 0, sizeof(state->bitmaps));
+    memset(state->periods, 0, sizeof(state->bitmaps));
+    state->bmp_cnt = 0;
+    memset(state->usecnts, 0, sizeof(state->usecnts));
+    memset(state->top_bitmaps, 0, sizeof(state->top_bitmaps));
+
+    if(state->preread == 0) {
+        err = zbm_build_initial_bitmap(state);
+        if(err)
+            return err;
+    }
+    state->period = 8;
+
+    while(state->read < state->decmp_len) {
+        err = zbm_compress_eight_bytes(state);
+        if(err)
+            return err;
+    }
+
+    return zbm_build_metadata(state, hdr);
+}
+
+static int zbm_compress_single_chunk(struct zbm_compress_state *state)
+{
+    struct zbm_chunk_hdr *decmp_hdr = NULL;
+    unsigned int max_chunk_sz;
+    int err;
+
+    state->read = 0;
+    state->written = 0;
+
+    state->decmp_len = MIN(state->src_left, ZBM_MAX_DECMP_CHUNK_SIZE);
+    state->src_end = state->src + state->decmp_len;
+
+    /* If a chunk gets bigger than this, we'll just store it uncompressed */
+    max_chunk_sz = state->decmp_len + sizeof(*decmp_hdr);
+    if(max_chunk_sz > state->dest_left)
+        return ZBM_RANGE;
+    state->dest_end = state->dest + max_chunk_sz;
+    decmp_hdr = (struct zbm_chunk_hdr *)state->dest;
+
+    state->dest += sizeof(*decmp_hdr);
+    state->written += sizeof(*decmp_hdr);
+
+    err = zbm_build_compressed_chunk(state);
+    if(err == ZBM_CANT_COMPRESS)
+        err = zbm_build_uncompressed_chunk(state);
+    if(err)
+        return err;
+
+    decmp_hdr->len = zbm_u32_to_u24(state->written);
+    decmp_hdr->decmp_len = zbm_u32_to_u24(state->decmp_len);
+    return 0;
+}
+
+static int zmb_max_compressed_length(size_t src_size, size_t *out_len)
+{
+    size_t max_chunk_size = sizeof(struct zbm_chunk_hdr) + 0x8000;
+    size_t chunk_count;
+
+    chunk_count = (src_size + ZBM_MAX_DECMP_CHUNK_SIZE - 1) >> ZBM_MAX_DECMP_CHUNK_SIZE_BITS;
+    if(chunk_count << ZBM_MAX_DECMP_CHUNK_SIZE_BITS < src_size)
+        return ZBM_OVERFLOW;
+
+    /* The magic, all the chunks, and the terminating empty chunk */
+    *out_len = sizeof(uint32_t) + chunk_count * max_chunk_size + ZBM_LAST_CHUNK_SIZE;
+    if(*out_len < src_size)
+        return ZBM_OVERFLOW;
+
+    return 0;
+}
+
+int zbm_compress(void *dest, size_t dest_size, const void *src, size_t src_size, size_t *out_len)
+{
+    struct zbm_compress_state *state = NULL;
+    int err = 0;
+
+    if(!dest)
+        return zmb_max_compressed_length(src_size, out_len);
+
+    state = calloc(1, sizeof(*state));
+    if(!state)
+        return ZBM_NOMEM;
+
+    state->src = src;
+    state->src_left = src_size;
+    state->dest = dest;
+    state->dest_left = dest_size;
+    state->preread = 0;
+    state->prewritten = 0;
+
+    err = zbm_write_magic(state);
+    if(err)
+        goto fail;
+
+    do {
+        err = zbm_compress_single_chunk(state);
+        if(err)
+            goto fail;
+        state->src_left -= state->read;
+        state->dest_left -= state->written;
+        state->preread += state->decmp_len;
+        state->prewritten += state->written;
+    } while(state->read != 0);
+
+    *out_len = state->prewritten;
+fail:
+    free(state);
+    return err;
+}
+
+int zbm_compress_chunk(void *dest, size_t dest_size, const void *src, size_t src_size, size_t index, size_t *out_len)
+{
+    struct zbm_compress_state *state = NULL;
+    size_t offset;
+    int err = 0;
+
+    state = calloc(1, sizeof(*state));
+    if(!state)
+        return ZBM_NOMEM;
+
+    state->src = src;
+    state->src_left = src_size;
+    state->dest = dest;
+    state->dest_left = dest_size;
+    state->preread = 0;
+    state->prewritten = 0;
+
+    if(index == 0) {
+        err = zbm_write_magic(state);
+        if(err)
+            goto fail;
+    }
+
+    offset = index << ZBM_MAX_DECMP_CHUNK_SIZE_BITS;
+    if(offset >> ZBM_MAX_DECMP_CHUNK_SIZE_BITS != index)
+        return ZBM_OVERFLOW;
+    if(state->src_left < offset) {
+        state->preread = state->src_left;
+        state->src += state->src_left;
+        state->src_left = 0;
+    } else {
+        state->preread = offset;
+        state->src += offset;
+        state->src_left -= offset;
+    }
+
+    err = zbm_compress_single_chunk(state);
+    if(err)
+        goto fail;
+    state->src_left -= state->read;
+    state->dest_left -= state->written;
+    state->preread += state->decmp_len;
+    state->prewritten += state->written;
+
+    *out_len = state->prewritten;
+fail:
+    free(state);
+    return err;
 }

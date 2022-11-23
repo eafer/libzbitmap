@@ -1,9 +1,9 @@
 CC = gcc
 
-CFLAGS = --std=gnu99 -O2 -Wall -Wextra -fno-strict-aliasing -I..
+CFLAGS = --std=gnu99 -O3 -Wall -Wextra -fno-strict-aliasing -pthread -I..
 
 test: test.o ../libzbitmap.a
-	$(CC) $(LDFLAGS) -o test test.o ../libzbitmap.a
+	$(CC) $(LDFLAGS) -pthread -o test test.o ../libzbitmap.a
 
 ../libzbitmap.a: FORCE
 	$(MAKE) -C .. --no-print-directory
