@@ -1,3 +1,6 @@
+#ifndef _LIBZBITMAP_H
+#define _LIBZBITMAP_H
+
 #include <stddef.h>
 
 #define ZBM_NOMEM       (-1)    /* Failed to allocate memory */
@@ -61,3 +64,5 @@ int zbm_compress(void *dest, size_t dest_size, const void *src, size_t src_size,
  * code in test/test.c.
  */
 int zbm_compress_chunk(void *dest, size_t dest_size, const void *src, size_t src_size, size_t index, size_t *out_len);
+
+#endif /* _LIBZBITMAP_H */
