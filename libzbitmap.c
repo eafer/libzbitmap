@@ -216,6 +216,12 @@ static int zbm_read_repetition_count(struct zbm_state *state, uint16_t *repeat)
     uint16_t total;
     int err;
 
+    /* Don't confuse the trailing bitmaps with a repetition count */
+    if(state->decmp_len - state->written <= 8) {
+        *repeat = 1;
+        return 0;
+    }
+
     err = zbm_read_nibble(&state->meta_3, state->src_end, &nibble);
     if(err)
         return err;
