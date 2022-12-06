@@ -36,7 +36,7 @@ struct zbm_cmp_chunk_hdr {
 
 /* Pointer to a half-byte */
 struct nybl_ptr {
-    const uint8_t   *addr;  /* Address of the byte */
+    uint8_t         *addr;  /* Address of the byte */
     int             nibble; /* Which of the two nibbles? */
 };
 
@@ -363,7 +363,7 @@ static int zbm_handle_compressed_chunk(struct zbm_state *state)
         return ZBM_INVAL;
     state->meta_1 = state->src + meta_off_1;
     state->meta_2 = state->src + meta_off_2;
-    state->meta_3.addr = state->src + meta_off_3;
+    state->meta_3.addr = (uint8_t *)state->src + meta_off_3;
     state->meta_3.nibble = 0;
 
     err = zbm_read_bitmaps(state);
@@ -747,50 +747,128 @@ static int zbm_equal_bmaps(struct zbm_bmap *bmap1, struct zbm_bmap *bmap2)
     return 1;
 }
 
-static int zbm_write_metadata_3(struct zbm_compress_state *state)
+static int zbm_bmap_num_for_index(struct zbm_compress_state *state, int idx)
 {
     struct zbm_bmap *bmap = NULL;
     struct zbm_bmap *top_bmap = NULL;
-    int nibble = 0;
-    int to_write = 0;
+    int i;
+
+    bmap = &state->bitmaps[idx];
+
+    /* This is one of the top bitmaps that go in the end of the chunk */
+    if(state->usecnts[zbm_bmprot(bmap)] == 0) {
+        for(i = 0; i < ZBM_BITMAP_COUNT; ++i) {
+            top_bmap = &state->top_bitmaps[i];
+            if(zbm_equal_bmaps(top_bmap, bmap))
+                return i + 3;
+        }
+    }
+
+    /* This is a regular bitmap from the second metadata area */
+    return bmap->period_bytecnt;
+}
+
+static int zbm_bmap_num_and_repcount(struct zbm_compress_state *state, int idx, int *repeat)
+{
+    int bmap_num, next_num;
+    int i;
+
+    bmap_num = zbm_bmap_num_for_index(state, idx);
+    *repeat = 1;
+
+    for(i = idx + 1; i < state->bmp_cnt; ++i) {
+        next_num = zbm_bmap_num_for_index(state, i);
+        if(next_num != bmap_num)
+            break;
+        *repeat += 1;
+    }
+    return bmap_num;
+}
+
+static int zbm_write_nibble(struct nybl_ptr *nybl, const uint8_t *limit, uint8_t val)
+{
+    if(nybl->addr >= limit)
+        return ZBM_CANT_COMPRESS;
+
+    if(nybl->nibble == 0) {
+        *nybl->addr = val;
+        nybl->nibble = 1;
+    } else {
+        *nybl->addr |= val << 4;
+        nybl->nibble = 0;
+        ++nybl->addr;
+    }
+    return 0;
+}
+
+static int zbm_write_repetition_count(struct nybl_ptr *nybl, const uint8_t *limit, int repeat)
+{
+    int nibble = 0xf;
+    int err;
+
+    /* 0xf marks that this is a repetition */
+    err = zbm_write_nibble(nybl, limit, nibble);
+    if(err)
+        return err;
+
+    /* We count from the minimum possible repetition count */
+    repeat -= 4;
+
+    while(repeat > 0) {
+        nibble = MIN(repeat, 0xf);
+        err = zbm_write_nibble(nybl, limit, nibble);
+        if(err)
+            return err;
+        repeat -= nibble;
+    }
+
+    /* The repetition must always end in a non-0xf nibble */
+    if(nibble == 0xf) {
+        err = zbm_write_nibble(nybl, limit, 0);
+        if(err)
+            return err;
+    }
+    return 0;
+}
+
+static int zbm_write_metadata_3(struct zbm_compress_state *state)
+{
+    struct nybl_ptr nybl = {0};
+    int to_write, repeat;
     int i, j;
+    int err;
 
-    /* TODO: repetitions */
-    for(i = 0; i < state->bmp_cnt; ++i) {
-        bmap = &state->bitmaps[i];
+    nybl.addr = state->dest;
+    nybl.nibble = 0;
 
-        if(state->dest == state->dest_end)
-            return ZBM_CANT_COMPRESS;
+    for(i = 0; i < state->bmp_cnt; i += repeat) {
+        to_write = zbm_bmap_num_and_repcount(state, i, &repeat);
 
-        /* This is one of the top bitmaps that go in the end of the chunk */
-        if(state->usecnts[zbm_bmprot(bmap)] == 0) {
-            for(j = 0; j < ZBM_BITMAP_COUNT; ++j) {
-                top_bmap = &state->top_bitmaps[j];
-                if(zbm_equal_bmaps(top_bmap, bmap)) {
-                    to_write = j + 3;
-                    break;
-                }
+        err = zbm_write_nibble(&nybl, state->dest_end, to_write);
+        if(err)
+            return err;
+
+        /* Fewer than 3 repetitions are done trivially */
+        if(repeat <= 3) {
+            for(j = 1; j < repeat; ++j) {
+                err = zbm_write_nibble(&nybl, state->dest_end, to_write);
+                if(err)
+                    return err;
             }
         } else {
-            to_write = bmap->period_bytecnt;
-        }
-
-        if(nibble == 0)
-            *state->dest = to_write;
-        else
-            *state->dest |= to_write << 4;
-        nibble ^= 1;
-        if(nibble == 0) {
-            ++state->dest;
-            ++state->written;
+            err = zbm_write_repetition_count(&nybl, state->dest_end, repeat);
+            if(err)
+                return err;
         }
     }
 
     /* Leave the trailing nibble alone and move on to the next byte */
-    if(nibble == 1) {
-        ++state->dest;
-        ++state->written;
+    if(nybl.nibble == 1) {
+        ++nybl.addr;
+        nybl.nibble = 0;
     }
+    state->written += nybl.addr - state->dest;
+    state->dest = nybl.addr;
     return 0;
 }
 
