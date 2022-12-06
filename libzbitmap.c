@@ -740,6 +740,8 @@ static int zbm_write_metadata_2(struct zbm_compress_state *state)
 
 static int zbm_equal_bmaps(struct zbm_bmap *bmap1, struct zbm_bmap *bmap2)
 {
+    if(!bmap1 || !bmap2)
+        return 0;
     if(bmap1->bitmap != bmap2->bitmap)
         return 0;
     if(bmap1->period_bytecnt != bmap2->period_bytecnt)
@@ -929,16 +931,18 @@ static struct uint24 zbm_u32_to_u24(uint32_t n)
 }
 
 struct top_bmap {
-    int         idx;
-    uint64_t    usecnt;
+    struct zbm_bmap *bmap;
+    uint64_t        usecnt;
 };
 
 /* The array is sorted by use count, in descending order */
-static void zbm_insert_in_top_bmaps(int idx, uint64_t usecnt, struct top_bmap tops[ZBM_BITMAP_COUNT])
+static void zbm_insert_in_top_bmaps(struct zbm_bmap *bmap, uint64_t usecnt, struct top_bmap tops[ZBM_BITMAP_COUNT])
 {
     int i;
 
     for(i = 0; i < ZBM_BITMAP_COUNT; ++i) {
+        if(zbm_equal_bmaps(tops[i].bmap, bmap)) /* Already in the array */
+            return;
         if(tops[i].usecnt < usecnt)
             break;
     }
@@ -946,8 +950,8 @@ static void zbm_insert_in_top_bmaps(int idx, uint64_t usecnt, struct top_bmap to
     if(i == ZBM_BITMAP_COUNT)
         return;
 
-    memmove(&tops[i + 1], &tops[i], ZBM_BITMAP_COUNT - i - 1);
-    tops[i].idx = idx;
+    memmove(&tops[i + 1], &tops[i], (ZBM_BITMAP_COUNT - i - 1) * sizeof(tops[i]));
+    tops[i].bmap = bmap;
     tops[i].usecnt = usecnt;
 }
 
@@ -959,7 +963,7 @@ static void zbm_find_most_common_bitmaps(struct zbm_compress_state *state)
 
     for(i = 0; i < state->bmp_cnt; ++i) {
         bmap = &state->bitmaps[i];
-        zbm_insert_in_top_bmaps(i, state->usecnts[zbm_bmprot(bmap)], tops);
+        zbm_insert_in_top_bmaps(bmap, state->usecnts[zbm_bmprot(bmap)], tops);
         bmap = NULL;
     }
 
@@ -970,7 +974,7 @@ static void zbm_find_most_common_bitmaps(struct zbm_compress_state *state)
             state->top_bitmaps[i].period_bytecnt = 0;
             continue;
         }
-        bmap = &state->bitmaps[tops[i].idx];
+        bmap = tops[i].bmap;
         state->top_bitmaps[i] = *bmap;
         /* Mark this as unused for the second metadata area */
         state->usecnts[zbm_bmprot(bmap)] = 0;
