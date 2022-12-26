@@ -1,3 +1,7 @@
+/*
+ * Author: Ernesto A. Fernández <ernesto@corellium.com>
+ */
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

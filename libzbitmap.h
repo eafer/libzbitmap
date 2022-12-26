@@ -1,3 +1,7 @@
+/*
+ * Author: Ernesto A. Fernández <ernesto@corellium.com>
+ */
+
 #ifndef _LIBZBITMAP_H
 #define _LIBZBITMAP_H
 
