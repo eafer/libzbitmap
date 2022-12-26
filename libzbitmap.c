@@ -3,8 +3,6 @@
 #include <string.h>
 #include "libzbitmap.h"
 
-#define __packed    __attribute__((packed))
-
 #define MIN(x, y)   ((x) > (y) ? (y) : (x))
 
 #define ZBM_MAGIC   0x094D425A
@@ -13,15 +11,16 @@
 #define ZBM_MAX_DECMP_CHUNK_SIZE_BITS   15
 
 struct uint24 {
-    uint16_t    lo;
-    uint8_t     hi;
-} __packed;
+    uint8_t     low;
+    uint8_t     mid;
+    uint8_t     hig;
+};
 
 /* This header is shared by both compressed and decompressed chunks */
 struct zbm_chunk_hdr {
     struct uint24   len;        /* Length of the chunk */
     struct uint24   decmp_len;  /* Length of the chunk after decompression */
-} __packed;
+};
 
 /* The full header for compressed chunks */
 struct zbm_cmp_chunk_hdr {
@@ -32,7 +31,7 @@ struct zbm_cmp_chunk_hdr {
     struct uint24   meta_off_1;
     struct uint24   meta_off_2;
     struct uint24   meta_off_3;
-} __packed;
+};
 
 /* Pointer to a half-byte */
 struct nybl_ptr {
@@ -98,9 +97,11 @@ static uint32_t zbm_u24_to_u32(struct uint24 n)
 {
     uint32_t res;
 
-    res = n.hi;
-    res <<= 16;
-    res += n.lo;
+    res = n.hig;
+    res <<= 8;
+    res += n.mid;
+    res <<= 8;
+    res += n.low;
     return res;
 }
 
@@ -925,8 +926,9 @@ static struct uint24 zbm_u32_to_u24(uint32_t n)
 {
     struct uint24 res;
 
-    res.lo = n;
-    res.hi = n >> 16;
+    res.low = n;
+    res.mid = n >> 8;
+    res.hig = n >> 16;
     return res;
 }
 
