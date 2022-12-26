@@ -5,7 +5,8 @@
 
 #define MIN(x, y)   ((x) > (y) ? (y) : (x))
 
-#define ZBM_MAGIC   0x094D425A
+#define ZBM_MAGIC       "ZBM\x09"
+#define ZBM_MAGIC_SZ    4
 
 #define ZBM_MAX_DECMP_CHUNK_SIZE        0x8000
 #define ZBM_MAX_DECMP_CHUNK_SIZE_BITS   15
@@ -79,17 +80,14 @@ struct zbm_state {
 
 static int zbm_check_magic(struct zbm_state *state)
 {
-    uint32_t magic;
-
-    if(state->src_left < sizeof(magic))
+    if(state->src_left < ZBM_MAGIC_SZ)
         return ZBM_INVAL;
 
-    magic = *(uint32_t *)state->src;
-    if(magic != ZBM_MAGIC)
+    if(memcmp(state->src, ZBM_MAGIC, ZBM_MAGIC_SZ))
         return ZBM_INVAL;
 
-    state->src += sizeof(magic);
-    state->src_left -= sizeof(magic);
+    state->src += ZBM_MAGIC_SZ;
+    state->src_left -= ZBM_MAGIC_SZ;
     return 0;
 }
 
@@ -480,17 +478,14 @@ static int zbm_bmprot(struct zbm_bmap *bmap)
 
 static int zbm_write_magic(struct zbm_compress_state *state)
 {
-    uint32_t *magic_p;
-
-    if(state->dest_left < sizeof(*magic_p))
+    if(state->dest_left < ZBM_MAGIC_SZ)
         return ZBM_INVAL;
 
-    magic_p = (uint32_t *)state->dest;
-    *magic_p = ZBM_MAGIC;
+    memcpy(state->dest, ZBM_MAGIC, ZBM_MAGIC_SZ);
 
-    state->dest += sizeof(*magic_p);
-    state->dest_left -= sizeof(*magic_p);
-    state->prewritten += sizeof(*magic_p);
+    state->dest += ZBM_MAGIC_SZ;
+    state->dest_left -= ZBM_MAGIC_SZ;
+    state->prewritten += ZBM_MAGIC_SZ;
     return 0;
 }
 
