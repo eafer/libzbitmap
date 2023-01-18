@@ -1,4 +1,7 @@
+/* SPDX-License-Identifier: MIT */
 /*
+ * Copyright (c) 2022 Corellium LLC
+ *
  * Author: Ernesto A. Fernández <ernesto@corellium.com>
  */
 
