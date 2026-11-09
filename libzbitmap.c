@@ -1157,8 +1157,10 @@ int zbm_compress_chunk(void *dest, size_t dest_size, const void *src, size_t src
     }
 
     offset = index << ZBM_MAX_DECMP_CHUNK_SIZE_BITS;
-    if(offset >> ZBM_MAX_DECMP_CHUNK_SIZE_BITS != index)
+    if(offset >> ZBM_MAX_DECMP_CHUNK_SIZE_BITS != index) {
+        free(state);
         return ZBM_OVERFLOW;
+    }
     if(state->src_left < offset) {
         state->preread = state->src_left;
         state->src += state->src_left;
