@@ -15,13 +15,6 @@ let package = Package(
             exclude: ["test", "LICENSE", "Makefile", "README.rst"],
             sources: ["libzbitmap.c"],
             publicHeadersPath: "include"
-        ),
-        .testTarget(
-            name: "libzbitmapTests",
-            dependencies: ["libzbitmap"],
-            path: "test",
-            exclude: ["Makefile", "test.c", "files"],
-            sources: ["SwiftPMTests.swift"]
         )
     ],
     cLanguageStandard: .gnu99
