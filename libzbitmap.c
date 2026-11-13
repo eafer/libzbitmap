@@ -394,7 +394,7 @@ static int zbm_handle_chunk(struct zbm_state *state)
     decmp_hdr = (struct zbm_chunk_hdr *)state->src;
 
     state->len = zbm_u24_to_u32(decmp_hdr->len);
-    if(state->len > state->src_left)
+    if(state->len < sizeof(*decmp_hdr) || state->len > state->src_left)
         return ZBM_INVAL;
     state->src_end = state->src + state->len;
 
