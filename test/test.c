@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "libzbitmap.h"
 
 static void fatal_with_loc(const char *fn, int line, int test)
@@ -27,6 +28,45 @@ static void report_results(void)
     puts("");
 
     exit(tests_failed != 0);
+}
+
+static void run_chunk_length_tests(void)
+{
+    unsigned char src[] = {
+        0x5a, 0x42, 0x4d, 0x09,
+        0, 0, 0, 1, 0, 0, 'x',
+        6, 0, 0, 0, 0, 0,
+    };
+    unsigned char dest;
+    size_t out_len, src_size, expected_len;
+    int len, query, err, expected_err;
+
+    /* A zero-length chunk used to loop forever in a size query. */
+    alarm(5);
+    for(len = 0; len <= 7; ++len) {
+        src[4] = len;
+        src[7] = len == 6 ? 0 : 1;
+        src_size = len == 7 ? sizeof(src) : 10;
+        expected_err = len < 6 ? ZBM_INVAL : 0;
+        expected_len = len == 6 ? 0 : 1;
+
+        for(query = 0; query <= 1; ++query) {
+            printf("chunk length %d (%s)... ", len, query ? "size" : "decode");
+            fflush(stdout);
+
+            out_len = 0;
+            dest = 0;
+            err = zbm_decompress(query ? NULL : &dest, query ? 0 : sizeof(dest), src, src_size, &out_len);
+            if(err != expected_err || (!err && (out_len != expected_len || (!query && len == 7 && dest != 'x')))) {
+                printf("FAILURE - error code: %d, output length: %zu\n", err, out_len);
+                ++tests_failed;
+            } else {
+                puts("SUCCESS");
+            }
+            ++tests_run;
+        }
+    }
+    alarm(0);
 }
 
 static char *read_file(int i, int which, size_t *len)
@@ -261,6 +301,8 @@ static void run_test(int i)
 int main(int argc, char *argv[])
 {
     int i;
+
+    run_chunk_length_tests();
 
     if(argc == 2) {
         run_test(atoi(argv[1]));
