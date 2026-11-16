@@ -432,9 +432,11 @@ int zbm_decompress(void *dest, size_t dest_size, const void *src, size_t src_siz
         err = zbm_handle_chunk(&state);
         if(err)
             return err;
+        if(state.decmp_len > SIZE_MAX - state.prewritten)
+            return ZBM_OVERFLOW;
+        state.prewritten += state.decmp_len;
         state.src += state.len;
         state.src_left -= state.len;
-        state.prewritten += state.decmp_len;
     } while(state.decmp_len != 0);
 
     *out_len = state.prewritten;
