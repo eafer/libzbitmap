@@ -8,3 +8,5 @@
 /tags
 /version.h
 /test/files/*-recompressed
+/.build/
+/.swiftpm/
